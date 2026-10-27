@@ -1,7 +1,78 @@
-name: probe
-on: workflow_dispatch
+name: deadman-check
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+env:
+  THRESHOLD_MINUTES: 25
+
 jobs:
-  probe:
+  check:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "probe"
+      - uses: actions/checkout@v4
+
+      - name: Evaluate heartbeat staleness and alert on transition
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -euo pipefail
+
+          LAST_PING=$(python3 -c "import json;print(json.load(open('heartbeat.json'))['last_ping_utc'])")
+          NOW_EPOCH=$(date -u +%s)
+          LAST_EPOCH=$(date -u -d "$LAST_PING" +%s)
+          STALE_MIN=$(( (NOW_EPOCH - LAST_EPOCH) / 60 ))
+          echo "last_ping_utc=$LAST_PING  stale_minutes=$STALE_MIN  threshold=$THRESHOLD_MINUTES"
+
+          ALERT_SENT=$(python3 -c "import json;print(json.load(open('state.json')).get('alert_sent', False))" 2>/dev/null || echo "False")
+          echo "alert_sent_currently=$ALERT_SENT"
+
+          send_telegram() {
+            local text="$1"
+            curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=${text}" >/dev/null
+          }
+
+          NEW_ALERT_SENT="$ALERT_SENT"
+
+          if [ "$STALE_MIN" -gt "$THRESHOLD_MINUTES" ]; then
+            if [ "$ALERT_SENT" != "True" ]; then
+              send_telegram "🔴 Cassandra fleet dead-man's switch: Mac host has not pinged in ${STALE_MIN} min (threshold ${THRESHOLD_MINUTES}min). Last ping: ${LAST_PING} UTC. Check the host (power/network/launchd) — nothing else will alert if it's down. (PPC-6891)"
+              NEW_ALERT_SENT="True"
+              echo "fired_down_alert=true"
+            else
+              echo "already_alerted_down=true"
+            fi
+          else
+            if [ "$ALERT_SENT" = "True" ]; then
+              send_telegram "🟢 Cassandra fleet dead-man's switch: Mac host heartbeat recovered (last ping ${STALE_MIN} min ago). (PPC-6891)"
+              NEW_ALERT_SENT="False"
+              echo "fired_recovery_alert=true"
+            else
+              echo "healthy_no_alert=true"
+            fi
+          fi
+
+          python3 -c "import json; json.dump({'alert_sent': $NEW_ALERT_SENT, 'checked_at_utc': '$(date -u +%Y-%m-%dT%H:%M:%SZ)', 'stale_minutes': $STALE_MIN}, open('state.json','w'))"
+
+      - name: Persist state if changed
+        run: |
+          set -euo pipefail
+          if ! git diff --quiet -- state.json; then
+            git config user.name "deadman-switch-bot"
+            git config user.email "deadman-switch-bot@users.noreply.github.com"
+            git add state.json
+            for i in 1 2 3; do
+              git commit -m "state update [skip ci]" && \
+              git pull --rebase origin main && \
+              git push origin main && break || { echo "push attempt $i failed, retrying"; sleep 5; }
+            done
+          else
+            echo "state unchanged, no commit needed"
+          fi
