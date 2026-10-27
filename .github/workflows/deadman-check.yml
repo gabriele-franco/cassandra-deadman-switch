@@ -34,9 +34,19 @@ jobs:
 
           send_telegram() {
             local text="$1"
-            curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            local resp
+            resp=$(curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
               -d "chat_id=${TELEGRAM_CHAT_ID}" \
-              --data-urlencode "text=${text}" >/dev/null
+              --data-urlencode "text=${text}")
+            local ok
+            ok=$(python3 -c "import json,sys;print(json.loads(sys.argv[1]).get('ok'))" "$resp")
+            local msg_id
+            msg_id=$(python3 -c "import json,sys;print(json.loads(sys.argv[1]).get('result',{}).get('message_id'))" "$resp")
+            echo "telegram_delivery_ok=${ok} telegram_message_id=${msg_id}"
+            if [ "$ok" != "True" ]; then
+              echo "telegram_response=${resp}"
+              return 1
+            fi
           }
 
           NEW_ALERT_SENT="$ALERT_SENT"
