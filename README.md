@@ -44,8 +44,16 @@ The `*/5` cron stays only as a restarter if a runner failure ever breaks the
 chain — its own cadence is still the ~6h figure above, so a broken chain's
 worst case is "~6h instead of ~5min" rather than silent forever.
 
+Confirmed post-fix: the self-chain dispatched its next run at
+`2026-10-28T08:29:05Z`, exactly `CHAIN_INTERVAL_SECONDS` (300s) after the
+prior run started — the real cadence is now ~5min, not ~6h.
+
 Run `scripts/fire_test.sh` to assert the actual delivered cadence (gap across
-*all* run triggers, not just `schedule`) and the alert path together.
+*all* run triggers, not just `schedule`) and the alert path together. The
+cadence check only looks at runs from the last `WINDOW_MINUTES` (default 60)
+— this is deliberate: the one-time startup lag while the chain's first link
+waited on GitHub's scheduler is historical and must age out of the check,
+not fail it forever.
 
 ## Tuning
 

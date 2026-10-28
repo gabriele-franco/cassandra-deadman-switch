@@ -16,21 +16,32 @@ REPO="gabriele-franco/cassandra-deadman-switch"
 WORKFLOW="deadman-check.yml"
 BOUND_MINUTES="${BOUND_MINUTES:-15}"
 LOOKBACK="${LOOKBACK:-50}"
+WINDOW_MINUTES="${WINDOW_MINUTES:-60}"
 SKIP_ALERT="${1:-}"
 
 echo "=== 1/2: cadence check ==="
-mapfile -t TIMESTAMPS < <(gh api "repos/$REPO/actions/workflows/$WORKFLOW/runs?per_page=$LOOKBACK" \
+# Only consider runs from the last WINDOW_MINUTES — the self-chain's one-time
+# startup lag (first run waiting on GitHub's scheduler, PPC-6914) is historical
+# and must age out, not permanently fail this check.
+CUTOFF_EPOCH=$(python3 -c "import datetime; print(int((datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=$WINDOW_MINUTES)).timestamp()))")
+mapfile -t ALL_TIMESTAMPS < <(gh api "repos/$REPO/actions/workflows/$WORKFLOW/runs?per_page=$LOOKBACK" \
   --jq '.workflow_runs[].created_at' | sort)
 
+TIMESTAMPS=()
+for ts in "${ALL_TIMESTAMPS[@]}"; do
+  EPOCH=$(python3 -c "import sys,datetime; print(int(datetime.datetime.strptime(sys.argv[1], '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=datetime.timezone.utc).timestamp()))" "$ts")
+  [ "$EPOCH" -ge "$CUTOFF_EPOCH" ] && TIMESTAMPS+=("$ts")
+done
+
 if [ "${#TIMESTAMPS[@]}" -lt 2 ]; then
-  echo "FAIL: not enough runs to measure cadence (${#TIMESTAMPS[@]} found)"
+  echo "FAIL: not enough runs in the last ${WINDOW_MINUTES}min window to measure cadence (${#TIMESTAMPS[@]} found)"
   exit 1
 fi
 
 MAX_GAP=0
 PREV_EPOCH=""
 for ts in "${TIMESTAMPS[@]}"; do
-  EPOCH=$(date -u -d "$ts" +%s)
+  EPOCH=$(python3 -c "import sys,datetime; print(int(datetime.datetime.strptime(sys.argv[1], '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=datetime.timezone.utc).timestamp()))" "$ts")
   if [ -n "$PREV_EPOCH" ]; then
     GAP=$(( (EPOCH - PREV_EPOCH) / 60 ))
     [ "$GAP" -gt "$MAX_GAP" ] && MAX_GAP=$GAP
@@ -51,7 +62,7 @@ fi
 
 echo "=== 2/2: alert path ==="
 TMP_HEARTBEAT=$(mktemp)
-OLD_PING=$(date -u -d "-30 minutes" +%Y-%m-%dT%H:%M:%SZ)
+OLD_PING=$(python3 -c "import datetime; print((datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=30)).strftime('%Y-%m-%dT%H:%M:%SZ'))")
 printf '{"last_ping_utc": "%s"}\n' "$OLD_PING" > "$TMP_HEARTBEAT"
 
 CURRENT_SHA=$(gh api "repos/$REPO/contents/heartbeat.json" --jq '.sha')
