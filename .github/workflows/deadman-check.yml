@@ -1,20 +1,33 @@
 name: deadman-check
 on:
   schedule:
+    # Best-effort recovery net only — GitHub deprioritizes schedule triggers
+    # hard on low-activity repos (measured gap up to 5h48m, see PPC-6914).
+    # The real ~5min cadence comes from the self-chain step below.
     - cron: "*/5 * * * *"
   workflow_dispatch: {}
 
+concurrency:
+  group: deadman-check
+  cancel-in-progress: true
+
 permissions:
   contents: write
+  actions: write
 
 env:
   THRESHOLD_MINUTES: 25
+  CHAIN_INTERVAL_SECONDS: 300
 
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Record job start
+        id: start
+        run: echo "epoch=$(date -u +%s)" >> "$GITHUB_OUTPUT"
 
       - name: Evaluate heartbeat staleness and alert on transition
         env:
@@ -86,3 +99,19 @@ jobs:
           else
             echo "state unchanged, no commit needed"
           fi
+
+      - name: Re-chain the next check (self-dispatch, independent of GitHub's scheduler)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TARGET_EPOCH=$(( ${{ steps.start.outputs.epoch }} + CHAIN_INTERVAL_SECONDS ))
+          NOW_EPOCH=$(date -u +%s)
+          SLEEP_SECONDS=$(( TARGET_EPOCH - NOW_EPOCH ))
+          if [ "$SLEEP_SECONDS" -gt 0 ]; then
+            sleep "$SLEEP_SECONDS"
+          fi
+          gh api --method POST \
+            "repos/${{ github.repository }}/actions/workflows/deadman-check.yml/dispatches" \
+            -f ref="${{ github.ref_name }}"
